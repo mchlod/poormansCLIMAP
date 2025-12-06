@@ -1,0 +1,749 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+    <meta charset="UTF-8">
+    <title>Mappa stazioni MeteoSvizzera (offline libs + vento)</title>
+
+    <!-- Tailwind Lite locale -->
+    <link rel="stylesheet" href="libs/tailwind/tailwind.css">
+
+    <!-- Leaflet locale -->
+    <link rel="stylesheet" href="libs/leaflet/leaflet.css">
+    <script src="libs/leaflet/leaflet.js"></script>
+
+    <!-- Proj4 locale -->
+    <script src="libs/proj4/proj4.js"></script>
+
+    <!-- ECharts locale (scarica echarts.min.js in libs/echarts) -->
+    <script src="libs/echarts/echarts.min.js"></script>
+
+    <style>
+        body { background: #f3f4f6; }
+        #map { height: 600px; }
+        .loader {
+            border: 4px solid #eee;
+            border-radius: 50%;
+            border-top: 4px solid #2563eb;
+            width: 26px;
+            height: 26px;
+            animation: spin 0.8s linear infinite;
+        }
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+
+        /* Barbule vento – versione più grande */
+        .wind-barb {
+            width: 40px;
+            height: 40px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .wind-barb-line {
+            width: 3px;
+            height: 26px;
+            background: #111;
+            position: relative;
+        }
+
+        .wind-barb-line::after {
+            content: "";
+            position: absolute;
+            top: -4px;
+            left: -3px;
+            border-width: 4px 3px 0 3px;
+            border-style: solid;
+            border-color: #111 transparent transparent transparent;
+        }
+    </style>
+</head>
+
+<body class="p-6">
+
+    <h1 class="text-3xl font-bold mb-2">Mappa delle stazioni MeteoSvizzera</h1>
+    <p class="text-gray-700 mb-4">
+        Stazioni SMN / NIME / SMN-precip con dati OGD colorate in base al valore,
+        stazioni OASI sempre in grigio. Dataset: giornaliero / orario / mensile. <br>
+        Per parametri di vento (fu… / dkl…) vengono visualizzate barbule orientate.
+        Cliccando su una stazione si apre il grafico temporale del parametro.
+    </p>
+
+    <div class="flex flex-wrap gap-4 mb-4 items-end">
+
+        <!-- PARAMETRO -->
+        <div>
+            <label class="text-sm font-semibold block mb-1">Parametro:</label>
+            <select id="paramSelect"
+                    class="border rounded p-2 w-72 text-sm"></select>
+            <p class="text-xs text-gray-500 mt-1">
+                Solo parametri realmente presenti nei CSV per il dataset scelto.
+            </p>
+        </div>
+
+        <!-- DATASET -->
+        <div>
+            <label class="text-sm font-semibold block mb-1">Dataset:</label>
+            <select id="intervalSelect" class="border rounded p-2 w-40 text-sm">
+                <option value="d">Giornaliero (d)</option>
+                <option value="h">Orario (h)</option>
+                <option value="m">Mensile (m)</option>
+            </select>
+        </div>
+
+        <!-- DATA -->
+        <div>
+            <label class="text-sm font-semibold block mb-1">Data:</label>
+            <input id="dateInput" type="date"
+                   class="border rounded p-2 w-40 text-sm">
+        </div>
+
+        <!-- LOADER -->
+        <div class="flex items-center gap-2">
+            <div id="loading" class="hidden flex items-center gap-2 text-sm">
+                <div class="loader"></div> <span>Carico dati…</span>
+            </div>
+        </div>
+    </div>
+
+    <div id="status" class="text-sm text-gray-700 mb-3"></div>
+
+    <div id="map" class="border rounded bg-white"></div>
+
+    <!-- Pannello grafico -->
+    <div id="chartPanel" class="mt-4 hidden">
+        <h2 id="chartTitle" class="text-xl font-bold mb-2"></h2>
+        <div id="chartContainer" class="border rounded bg-white" style="height:320px;"></div>
+        <p id="chartStatus" class="text-xs text-gray-500 mt-1"></p>
+    </div>
+
+    <!-- Config MeteoSvizzera -->
+    <script src="config.js"></script>
+
+    <script>
+    document.addEventListener('DOMContentLoaded', () => {
+        if (typeof METEO_CONFIG === 'undefined') {
+            console.error('METEO_CONFIG non trovato (config.js manca o non viene caricato).');
+            return;
+        }
+
+        // Inizializza sistemi di coordinate per proj4 (dal tuo config.js)
+        if (typeof METEO_CONFIG.initializeProj4Defs === 'function') {
+            METEO_CONFIG.initializeProj4Defs();
+        }
+
+        // --------------------- MAPPA ---------------------
+        let map = L.map("map").setView([46.6, 8.8], 8);
+
+        // Layer OSM di fallback
+        const osmLayer = L.tileLayer(
+            "https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",
+            {
+                maxZoom: 19,
+                attribution: "&copy; OpenStreetMap contributors"
+            }
+        );
+
+        // Tiles Swisstopo (restano da remoto, ma non passano da CDN script/css)
+        const wmtsLayer = L.tileLayer(
+            "https://wmts.geo.admin.ch/1.0.0/ch.swisstopo.pixelkarte-grau/default/current/3857/{z}/{x}/{y}.jpeg",
+            { attribution: "&copy; swisstopo", maxZoom: 18 }
+        );
+
+        // Se le tile Swisstopo vengono bloccate (Tracking Prevention / rete),
+        // facciamo fallback automatico su OSM
+        wmtsLayer.on("tileerror", () => {
+            console.warn("WMTS swisstopo non raggiungibile, passo a OSM");
+            if (map.hasLayer(wmtsLayer)) {
+                map.removeLayer(wmtsLayer);
+            }
+            if (!map.hasLayer(osmLayer)) {
+                osmLayer.addTo(map);
+            }
+        });
+
+        wmtsLayer.addTo(map);
+
+        let layerGroup = L.layerGroup().addTo(map);
+
+        const stations = METEO_CONFIG.stations;
+
+        // Stazioni con dataset OGD
+        const ogdStations = Object.keys(stations).filter(
+            code => stations[code].dataSource &&
+                    (stations[code].dataSource.includes("ogd-smn") ||
+                     stations[code].dataSource.includes("ogd-nime") ||
+                     stations[code].dataSource.includes("ogd-smn-precip"))
+        );
+
+        // Stazioni OASI (senza dataSource)
+        const oasiStations = Object.keys(stations).filter(
+            code => !stations[code].dataSource
+        );
+
+        // Cache: per ogni stazione & dataset (d/h/m) unione historical+recent
+        const cache = {};  // { STN_interval: { headers:[], rows:[] } }
+
+        const paramSelect    = document.getElementById('paramSelect');
+        const intervalSelect = document.getElementById('intervalSelect');
+        const dateInput      = document.getElementById('dateInput');
+        const loadingEl      = document.getElementById('loading');
+        const statusEl       = document.getElementById('status');
+
+        const chartPanel     = document.getElementById('chartPanel');
+        const chartTitleEl   = document.getElementById('chartTitle');
+        const chartStatusEl  = document.getElementById('chartStatus');
+        const chartContainer = document.getElementById('chartContainer');
+        let chartInstance    = null;
+
+        // Data di default: ieri
+        const d = new Date();
+        d.setDate(d.getDate() - 1);
+        dateInput.value = d.toISOString().slice(0,10);
+
+        // ------------------------------------------------
+        // Carica CSV: unisce sempre *_historical + *_recent (o t_recent + t_historical)
+        // ------------------------------------------------
+        async function fetchCSV(url) {
+            try {
+                const res = await fetch(url);
+                if (!res.ok) throw new Error('HTTP ' + res.status);
+                const text = await res.text();
+                const lines = text.split('\n').filter(l => l.trim() !== '');
+                if (!lines.length) return null;
+                const headers = lines[0].split(';').map(x => x.trim());
+                const rows = lines.slice(1).map(l => l.split(';').map(x => x.trim()));
+                return { headers, rows };
+            } catch (e) {
+                console.warn('Errore CSV', url, e);
+                return null;
+            }
+        }
+
+        async function loadCSV(stationCode) {
+            const st = stations[stationCode];
+            if (!st || !st.dataSource) return;
+
+            const interval = intervalSelect.value; // d / h / m
+            const cacheKey = stationCode + '_' + interval;
+            if (cache[cacheKey]) return;  // già caricato
+
+            const base = `https://data.geo.admin.ch/ch.meteoschweiz.${st.dataSource}/${stationCode.toLowerCase()}/${st.dataSource}_${stationCode.toLowerCase()}`;
+
+            let urls = [];
+            if (interval === 'd') {
+                urls = [`${base}_d_historical.csv`, `${base}_d_recent.csv`];
+            } else if (interval === 'm') {
+                urls = [`${base}_m.csv`];
+            } else {
+                urls = [`${base}_t_recent.csv`];
+                const currentYear = new Date().getFullYear();
+                const firstDecade = 1980;
+                const startDecade = Math.floor(currentYear / 10) * 10;
+                for (let y = startDecade; y >= firstDecade; y -= 10) {
+                    const dstr = `${y}-${y + 9}`;
+                    urls.push(`${base}_t_historical_${dstr}.csv`);
+                }
+            }
+
+            loadingEl.classList.remove('hidden');
+            let merged = null;
+
+            for (const url of urls) {
+                const part = await fetchCSV(url);
+                if (!part) continue;
+                if (!merged) {
+                    merged = { headers: part.headers.slice(), rows: [] };
+                }
+                merged.rows.push(...part.rows);
+            }
+
+            if (merged) {
+                const idxTime = 1;
+                merged.rows.sort((a, b) => {
+                    const ta = a[idxTime] || '';
+                    const tb = b[idxTime] || '';
+                    if (ta < tb) return -1;
+                    if (ta > tb) return 1;
+                    return 0;
+                });
+            }
+
+            cache[cacheKey] = merged;
+            loadingEl.classList.add('hidden');
+        }
+
+        // ------------------------------------------------
+        // Costruisce lista parametri disponibili per dataset
+        // ------------------------------------------------
+        async function buildAvailableParameterList() {
+            const interval = intervalSelect.value;   // d/h/m
+            const suffix   = interval + '0';         // d0/h0/m0
+
+            // Piccolo campione per scoprire parametri reali
+            const sample = ogdStations.slice(0, 5);
+            for (const s of sample) {
+                await loadCSV(s);
+            }
+
+            const found = new Set();
+
+            for (const st of sample) {
+                const key = st + '_' + interval;
+                const obj = cache[key];
+                if (!obj) continue;
+                for (const h of obj.headers) {
+                    if (h.endsWith(suffix) && METEO_CONFIG.parameterMap[h]) {
+                        found.add(h);
+                    }
+                }
+            }
+
+            const list = [...found].sort((a, b) =>
+                METEO_CONFIG.parameterMap[a].name.localeCompare(METEO_CONFIG.parameterMap[b].name)
+            );
+
+            paramSelect.innerHTML = '';
+
+            if (!list.length) {
+                const opt = document.createElement('option');
+                opt.value = '';
+                opt.textContent = 'Nessun parametro trovato per questo dataset';
+                paramSelect.appendChild(opt);
+                return;
+            }
+
+            for (const code of list) {
+                const info = METEO_CONFIG.parameterMap[code];
+                const opt = document.createElement('option');
+                opt.value = code;
+                opt.textContent = `${info.name} (${info.unit})`;
+                paramSelect.appendChild(opt);
+            }
+        }
+
+        // ------------------------------------------------
+        // Valore scalare per stazione/param/data
+        // ------------------------------------------------
+        function getValue(stCode, param, dateISO) {
+            const interval = intervalSelect.value;
+            const key = stCode + '_' + interval;
+            const obj = cache[key];
+            if (!obj) return null;
+
+            const headers = obj.headers;
+            const rows    = obj.rows;
+            const idxTime = 1;
+            const idxParam = headers.indexOf(param);
+            if (idxParam < 0) return null;
+
+            for (const r of rows) {
+                const t = r[idxTime];
+                if (!t) continue;
+                const datePart = t.split(' ')[0]; // "dd.mm.yyyy"
+                const [dd, mm, yy] = datePart.split('.');
+                const iso = `${yy}-${mm}-${dd}`;
+                if (iso === dateISO) {
+                    const v = parseFloat(String(r[idxParam]).replace(',', '.'));
+                    return Number.isNaN(v) ? null : v;
+                }
+            }
+            return null;
+        }
+
+        // ------------------------------------------------
+        // Valori vento (speed + direction)
+        // ------------------------------------------------
+        function getWindValues(stCode, speedParam, dateISO) {
+            const interval = intervalSelect.value;
+            const key = stCode + '_' + interval;
+            const obj = cache[key];
+            if (!obj) return null;
+
+            const headers = obj.headers;
+            const rows    = obj.rows;
+            const idxTime = 1;
+
+            const idxSpeed = headers.indexOf(speedParam);
+            // prima colonna di direzione vento che troviamo
+            const idxDir = headers.findIndex(h => h.startsWith('dkl'));
+
+            if (idxSpeed < 0 || idxDir < 0) return null;
+
+            for (const r of rows) {
+                const t = r[idxTime];
+                if (!t) continue;
+                const datePart = t.split(' ')[0];
+                const [dd, mm, yy] = datePart.split('.');
+                const iso = `${yy}-${mm}-${dd}`;
+                if (iso === dateISO) {
+                    const vSpeed = parseFloat(String(r[idxSpeed]).replace(',', '.'));
+                    const vDir   = parseFloat(String(r[idxDir]).replace(',', '.'));
+                    if (Number.isNaN(vSpeed) || Number.isNaN(vDir)) return null;
+                    return { speed: vSpeed, dir: vDir };
+                }
+            }
+            return null;
+        }
+
+        // ------------------------------------------------
+        // Scala colore semplice
+        // ------------------------------------------------
+        function colorScale(t) {
+            const r = Math.round(255 * t);
+            const b = Math.round(255 * (1 - t));
+            return `rgb(${r},0,${b})`;
+        }
+
+        // ------------------------------------------------
+        // Icona barbula vento – versione più grande
+        // ------------------------------------------------
+        function createWindIcon(directionDeg, speed, color) {
+            const rot = directionDeg; // "da dove soffia" (se vuoi "verso" aggiungi +180)
+
+            const clampedSpeed = Math.max(0, Math.min(speed || 0, 40)); // 0–40
+            const size = 30 + clampedSpeed * 0.6; // base più grande + dipendenza da velocità
+
+            const html = `
+              <div class="wind-barb" style="transform: rotate(${rot}deg);">
+                <div class="wind-barb-line" style="
+                  height:${size}px;
+                  background:${color};
+                  border-top-color:${color};
+                "></div>
+              </div>
+            `;
+
+            return L.divIcon({
+                html,
+                className: '',
+                iconSize: [size, size],
+                iconAnchor: [size / 2, size / 2]
+            });
+        }
+
+        // ------------------------------------------------
+        // Parsing data per ECharts
+        // ------------------------------------------------
+        function parseCsvDate(t) {
+            if (!t) return null;
+            const parts = t.split(' ');
+            const dmy = parts[0].split('.');
+            if (dmy.length !== 3) return null;
+            const dd = parseInt(dmy[0], 10);
+            const mm = parseInt(dmy[1], 10);
+            const yy = parseInt(dmy[2], 10);
+            let hh = 0, mi = 0;
+            if (parts[1]) {
+                const hm = parts[1].split(':');
+                hh = parseInt(hm[0] || '0', 10);
+                mi = parseInt(hm[1] || '0', 10);
+            }
+            return new Date(yy, mm - 1, dd, hh, mi);
+        }
+
+        async function showStationTimeSeries(stCode) {
+            const param   = paramSelect.value;
+            const interval = intervalSelect.value;
+            if (!param) return;
+
+            const info = METEO_CONFIG.parameterMap[param] || { name: param, unit: '' };
+
+            const cacheKey = stCode + '_' + interval;
+            if (!cache[cacheKey]) {
+                await loadCSV(stCode);
+            }
+            const obj = cache[cacheKey];
+
+            if (!obj) {
+                chartPanel.classList.remove('hidden');
+                chartTitleEl.textContent = `${stations[stCode].name} (${stCode}) – ${info.name}`;
+                chartContainer.innerHTML = '';
+                chartStatusEl.textContent = 'Nessun dataset OGD disponibile per questa stazione e dataset.';
+                return;
+            }
+
+            const headers = obj.headers;
+            const rows    = obj.rows;
+            const idxTime = 1;
+            const idxParam = headers.indexOf(param);
+
+            if (idxParam < 0) {
+                chartPanel.classList.remove('hidden');
+                chartTitleEl.textContent = `${stations[stCode].name} (${stCode}) – ${info.name}`;
+                chartContainer.innerHTML = '';
+                chartStatusEl.textContent = 'Parametro non presente nel CSV per questo dataset.';
+                return;
+            }
+
+            const seriesData = [];
+            for (const r of rows) {
+                const t = r[idxTime];
+                if (!t) continue;
+                const dateObj = parseCsvDate(t);
+                if (!dateObj) continue;
+                const raw = r[idxParam];
+                if (raw === undefined || raw === null || raw === '') continue;
+                const v = parseFloat(String(raw).replace(',', '.'));
+                if (Number.isNaN(v)) continue;
+                seriesData.push([dateObj, v]);
+            }
+
+            if (!seriesData.length) {
+                chartPanel.classList.remove('hidden');
+                chartTitleEl.textContent = `${stations[stCode].name} (${stCode}) – ${info.name}`;
+                chartContainer.innerHTML = '';
+                chartStatusEl.textContent = 'Nessun valore numerico disponibile per questo parametro.';
+                return;
+            }
+
+            // Ordina per data
+            seriesData.sort((a, b) => a[0] - b[0]);
+
+            if (!chartInstance) {
+                chartInstance = echarts.init(chartContainer);
+            }
+
+            const dataForChart = seriesData.map(([d, v]) => {
+                return { value: [d, v] };
+            });
+
+            chartInstance.setOption({
+                tooltip: { trigger: 'axis' },
+                grid: { left: '6%', right: '3%', top: 40, bottom: 60 },
+                dataZoom: [
+                    { type: 'inside' },
+                    { type: 'slider', bottom: 10 }
+                ],
+                xAxis: {
+                    type: 'time',
+                    name: 'Data',
+                    axisLabel: {
+                        formatter: value => {
+                            const d = new Date(value);
+                            return d.toLocaleDateString('it-CH');
+                        }
+                    }
+                },
+                yAxis: {
+                    type: 'value',
+                    name: info.unit || '',
+                    scale: true
+                },
+                series: [{
+                    name: info.name,
+                    type: 'line',
+                    showSymbol: false,
+                    smooth: false,
+                    data: dataForChart
+                }]
+            });
+
+            chartPanel.classList.remove('hidden');
+            chartTitleEl.textContent = `${stations[stCode].name} (${stCode}) – ${info.name}`;
+            chartStatusEl.textContent = `Punti disponibili: ${seriesData.length}`;
+            setTimeout(() => { chartInstance && chartInstance.resize(); }, 0);
+        }
+
+        // ------------------------------------------------
+        // Aggiorna mappa
+        // ------------------------------------------------
+        async function updateMap() {
+            const param   = paramSelect.value;
+            const dateISO = dateInput.value;
+
+            if (!param || !dateISO) return;
+
+            loadingEl.classList.remove('hidden');
+            layerGroup.clearLayers();
+            statusEl.textContent = 'Carico dati OGD…';
+
+            const info = METEO_CONFIG.parameterMap[param] || { name: param, unit: '' };
+            const isWindParam = param.startsWith('fu3') || param.startsWith('dkl');
+
+            // Carica CSV per tutte le stazioni OGD (historical + recent)
+            await Promise.all(ogdStations.map(s => loadCSV(s)));
+
+            const values = [];
+            const perStation = {};
+
+            if (isWindParam) {
+                for (const st of ogdStations) {
+                    const w = getWindValues(st, param, dateISO);
+                    if (w) {
+                        values.push(w.speed);
+                        perStation[st] = w;
+                    }
+                }
+            } else {
+                for (const st of ogdStations) {
+                    const v = getValue(st, param, dateISO);
+                    if (v !== null) {
+                        values.push(v);
+                        perStation[st] = v;
+                    }
+                }
+            }
+
+            if (!values.length) {
+                statusEl.textContent =
+                    `Nessun valore trovato per ${info.name} alla data ${dateISO} (dataset ${intervalSelect.value}).`;
+            } else {
+                const min = Math.min(...values);
+                const max = Math.max(...values);
+
+                statusEl.textContent =
+                    `Parametro: ${info.name} – Valori trovati: ${values.length}/${ogdStations.length} `
+                    + `(min=${min.toFixed(2)}, max=${max.toFixed(2)} ${info.unit})`;
+
+                // Disegna stazioni OGD
+                for (const st of ogdStations) {
+                    const S = stations[st];
+                    const coords = proj4('EPSG:2056', 'EPSG:4326', [S.east, S.north]);
+                    const latLng = [coords[1], coords[0]];
+
+                    let marker;
+
+                    if (isWindParam) {
+                        const w = perStation[st];
+                        if (w) {
+                            const min = Math.min(...values);
+                            const max = Math.max(...values);
+                            const t = (w.speed - min) / (max - min || 1);
+                            const color = colorScale(t);
+                            const icon = createWindIcon(w.dir, w.speed, color);
+
+                            marker = L.marker(latLng, { icon });
+
+                            const tooltipHtml = `
+                                <b>${S.name}</b> (${st})<br>
+                                <b>${info.name}</b>: ${w.speed.toFixed(1)} ${info.unit}<br>
+                                Direzione: ${w.dir.toFixed(0)}°<br>
+                                <span style="font-size:11px">${dateISO}</span>
+                            `;
+
+                            marker.bindTooltip(tooltipHtml, {
+                                direction: 'top',
+                                sticky: true,
+                                opacity: 0.9
+                            });
+                        } else {
+                            marker = L.circleMarker(latLng, {
+                                radius: 6,
+                                fillColor: '#aaaaaa',
+                                fillOpacity: 0.5,
+                                color: '#222',
+                                weight: 1
+                            });
+
+                            const tooltipHtml = `
+                                <b>${S.name}</b> (${st})<br>
+                                Nessun valore disponibile per il vento a ${dateISO}
+                            `;
+
+                            marker.bindTooltip(tooltipHtml, {
+                                direction: 'top',
+                                sticky: true,
+                                opacity: 0.9
+                            });
+                        }
+                    } else {
+                        const v = perStation[st];
+                        const min = Math.min(...values);
+                        const max = Math.max(...values);
+                        let color = '#aaaaaa';
+                        let radius = 6;
+                        let label = 'n.d.';
+
+                        if (v !== undefined) {
+                            const t = (v - min) / (max - min || 1);
+                            color = colorScale(t);
+                            radius = 8;
+                            label = `${v.toFixed(2)} ${info.unit}`;
+                        }
+
+                        marker = L.circleMarker(latLng, {
+                            radius,
+                            fillColor: color,
+                            fillOpacity: 0.9,
+                            color: '#222',
+                            weight: 1
+                        });
+
+                        const tooltipHtml = `
+                            <b>${S.name}</b> (${st})<br>
+                            <b>${info.name}</b>: ${label}<br>
+                            <span style="font-size:11px">${dateISO}</span>
+                        `;
+
+                        marker.bindTooltip(tooltipHtml, {
+                            direction: 'top',
+                            sticky: true,
+                            opacity: 0.9
+                        });
+                    }
+
+                    marker.on('click', () => {
+                        showStationTimeSeries(st);
+                    });
+
+                    layerGroup.addLayer(marker);
+                }
+            }
+
+            // Stazioni OASI sempre in grigio, con tooltip
+            for (const st of oasiStations) {
+                const S = stations[st];
+                const coords = proj4('EPSG:2056', 'EPSG:4326', [S.east, S.north]);
+                const latLng = [coords[1], coords[0]];
+
+                const mk = L.circleMarker(latLng, {
+                    radius: 6,
+                    fillColor: '#777',
+                    fillOpacity: 0.5,
+                    color: '#444',
+                    weight: 1
+                });
+
+                const tooltipHtml = `
+                    <b>${S.name}</b> (${st})<br>
+                    <i>Nessun dataset OGD disponibile</i>
+                `;
+
+                mk.bindTooltip(tooltipHtml, {
+                    direction: 'top',
+                    sticky: true,
+                    opacity: 0.9
+                });
+
+                mk.on('click', () => {
+                    showStationTimeSeries(st);
+                });
+
+                layerGroup.addLayer(mk);
+            }
+
+            loadingEl.classList.add('hidden');
+        }
+
+        // Eventi: aggiorna automaticamente
+        intervalSelect.addEventListener('change', async () => {
+            await buildAvailableParameterList();
+            setTimeout(updateMap, 150);
+        });
+
+        paramSelect.addEventListener('change', updateMap);
+        dateInput.addEventListener('change', updateMap);
+
+        // Init: lista parametri + prima mappa
+        (async () => {
+            await buildAvailableParameterList();
+            await updateMap();
+        })();
+    });
+    </script>
+
+</body>
+</html>
